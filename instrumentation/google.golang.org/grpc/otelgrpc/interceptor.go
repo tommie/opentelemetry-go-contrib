@@ -18,6 +18,7 @@ package otelgrpc // import "go.opentelemetry.io/contrib/instrumentation/google.g
 // https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/semantic_conventions/rpc.md
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 
@@ -76,7 +77,8 @@ func UnaryClientInterceptor(opts ...Option) grpc.UnaryClientInterceptor {
 		requestMetadata, _ := metadata.FromOutgoingContext(ctx)
 		metadataCopy := requestMetadata.Copy()
 
-		tracer := newConfig(opts).TracerProvider.Tracer(
+		cfg := newConfig(opts)
+		tracer := cfg.TracerProvider.Tracer(
 			instrumentationName,
 			trace.WithInstrumentationVersion(SemVersion()),
 		)
@@ -100,16 +102,33 @@ func UnaryClientInterceptor(opts ...Option) grpc.UnaryClientInterceptor {
 
 		messageReceived.Event(ctx, 1, reply)
 
-		if err != nil {
-			s, _ := status.FromError(err)
-			span.SetStatus(codes.Error, s.Message())
-			span.SetAttributes(statusCodeAttr(s.Code()))
-		} else {
-			span.SetAttributes(statusCodeAttr(grpc_codes.OK))
-		}
+		setSpanStatus(ctx, cfg, span, err)
 
 		return err
 	}
+}
+
+func setSpanStatus(ctx context.Context, cfg *config, span trace.Span, err error) {
+	if err != nil {
+		s := status.Convert(err)
+		span.SetAttributes(statusCodeAttr(s.Code()))
+
+		if cfg.IgnoreCancel && isCanceled(ctx, err, s) {
+			span.SetAttributes(canceledAttr())
+		} else {
+			span.SetStatus(codes.Error, s.Message())
+		}
+	} else {
+		span.SetAttributes(statusCodeAttr(grpc_codes.OK))
+	}
+}
+
+func isCanceled(ctx context.Context, err error, s *status.Status) bool {
+	if ctx.Err() != context.Canceled {
+		return false
+	}
+
+	return errors.Is(err, context.Canceled) || s.Code() == grpc_codes.Canceled
 }
 
 type streamEventType int
@@ -246,7 +265,8 @@ func StreamClientInterceptor(opts ...Option) grpc.StreamClientInterceptor {
 		requestMetadata, _ := metadata.FromOutgoingContext(ctx)
 		metadataCopy := requestMetadata.Copy()
 
-		tracer := newConfig(opts).TracerProvider.Tracer(
+		cfg := newConfig(opts)
+		tracer := cfg.TracerProvider.Tracer(
 			instrumentationName,
 			trace.WithInstrumentationVersion(SemVersion()),
 		)
@@ -265,9 +285,7 @@ func StreamClientInterceptor(opts ...Option) grpc.StreamClientInterceptor {
 
 		s, err := streamer(ctx, desc, cc, method, callOpts...)
 		if err != nil {
-			grpcStatus, _ := status.FromError(err)
-			span.SetStatus(codes.Error, grpcStatus.Message())
-			span.SetAttributes(statusCodeAttr(grpcStatus.Code()))
+			setSpanStatus(ctx, cfg, span, err)
 			span.End()
 			return s, err
 		}
@@ -276,13 +294,7 @@ func StreamClientInterceptor(opts ...Option) grpc.StreamClientInterceptor {
 		go func() {
 			err := <-stream.finished
 
-			if err != nil {
-				s, _ := status.FromError(err)
-				span.SetStatus(codes.Error, s.Message())
-				span.SetAttributes(statusCodeAttr(s.Code()))
-			} else {
-				span.SetAttributes(statusCodeAttr(grpc_codes.OK))
-			}
+			setSpanStatus(ctx, cfg, span, err)
 
 			span.End()
 		}()
@@ -306,7 +318,8 @@ func UnaryServerInterceptor(opts ...Option) grpc.UnaryServerInterceptor {
 		bags, spanCtx := Extract(ctx, &metadataCopy, opts...)
 		ctx = baggage.ContextWithBaggage(ctx, bags)
 
-		tracer := newConfig(opts).TracerProvider.Tracer(
+		cfg := newConfig(opts)
+		tracer := cfg.TracerProvider.Tracer(
 			instrumentationName,
 			trace.WithInstrumentationVersion(SemVersion()),
 		)
@@ -323,13 +336,10 @@ func UnaryServerInterceptor(opts ...Option) grpc.UnaryServerInterceptor {
 		messageReceived.Event(ctx, 1, req)
 
 		resp, err := handler(ctx, req)
+		setSpanStatus(ctx, cfg, span, err)
 		if err != nil {
-			s, _ := status.FromError(err)
-			span.SetStatus(codes.Error, s.Message())
-			span.SetAttributes(statusCodeAttr(s.Code()))
-			messageSent.Event(ctx, 1, s.Proto())
+			messageSent.Event(ctx, 1, status.Convert(err).Proto())
 		} else {
-			span.SetAttributes(statusCodeAttr(grpc_codes.OK))
 			messageSent.Event(ctx, 1, resp)
 		}
 
@@ -395,7 +405,8 @@ func StreamServerInterceptor(opts ...Option) grpc.StreamServerInterceptor {
 		bags, spanCtx := Extract(ctx, &metadataCopy, opts...)
 		ctx = baggage.ContextWithBaggage(ctx, bags)
 
-		tracer := newConfig(opts).TracerProvider.Tracer(
+		cfg := newConfig(opts)
+		tracer := cfg.TracerProvider.Tracer(
 			instrumentationName,
 			trace.WithInstrumentationVersion(SemVersion()),
 		)
@@ -411,13 +422,7 @@ func StreamServerInterceptor(opts ...Option) grpc.StreamServerInterceptor {
 
 		err := handler(srv, wrapServerStream(ctx, ss))
 
-		if err != nil {
-			s, _ := status.FromError(err)
-			span.SetStatus(codes.Error, s.Message())
-			span.SetAttributes(statusCodeAttr(s.Code()))
-		} else {
-			span.SetAttributes(statusCodeAttr(grpc_codes.OK))
-		}
+		setSpanStatus(ctx, cfg, span, err)
 
 		return err
 	}
@@ -462,4 +467,8 @@ func peerFromCtx(ctx context.Context) string {
 // statusCodeAttr returns status code attribute based on given gRPC code.
 func statusCodeAttr(c grpc_codes.Code) attribute.KeyValue {
 	return GRPCStatusCodeKey.Int64(int64(c))
+}
+
+func canceledAttr() attribute.KeyValue {
+	return GRPCCanceledKey.Bool(true)
 }

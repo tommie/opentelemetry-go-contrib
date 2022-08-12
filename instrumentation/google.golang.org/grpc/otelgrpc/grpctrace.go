@@ -31,12 +31,15 @@ const (
 	instrumentationName = "go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	// GRPCStatusCodeKey is convention for numeric status code of a gRPC request.
 	GRPCStatusCodeKey = attribute.Key("rpc.grpc.status_code")
+	// GRPCCanceledKey has a true value if the gRPC request was canceled by the client.
+	GRPCCanceledKey = attribute.Key("rpc.grpc.canceled")
 )
 
 // config is a group of options for this instrumentation.
 type config struct {
 	Propagators    propagation.TextMapPropagator
 	TracerProvider trace.TracerProvider
+	IgnoreCancel   bool
 }
 
 // Option applies an option value for a config.
@@ -49,6 +52,7 @@ func newConfig(opts []Option) *config {
 	c := &config{
 		Propagators:    otel.GetTextMapPropagator(),
 		TracerProvider: otel.GetTracerProvider(),
+		IgnoreCancel:   false,
 	}
 	for _, o := range opts {
 		o.apply(c)
@@ -82,6 +86,20 @@ func (o tracerProviderOption) apply(c *config) {
 // creating a Tracer.
 func WithTracerProvider(tp trace.TracerProvider) Option {
 	return tracerProviderOption{tp: tp}
+}
+
+type ignoreCancelOption struct{ ignore bool }
+
+func (o ignoreCancelOption) apply(c *config) {
+	c.IgnoreCancel = o.ignore
+}
+
+// WithIgnoreCancel returns an Option to convert context.Canceled and
+// gRPC's codes.Canceled into codes.Ok instead of
+// codes.Error. Cancellations will be marked with the GRPCCanceledKey
+// attribute.
+func WithIgnoreCancel(ignore bool) Option {
+	return ignoreCancelOption{ignore: ignore}
 }
 
 type metadataSupplier struct {
